@@ -1,0 +1,9 @@
+langchain
+openai
+python-dotenv==1.0.1
+langchain-community
+langchain-openai
+pydantic
+fastapi>=0.68.0
+uvicorn>=0.15.0
+chromadb==0.4.22

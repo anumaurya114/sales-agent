@@ -190,7 +190,37 @@ class SalesAgent:
                         "required": ["identified_product", "needs_clarification"]
                     }
                 }
+            },
+            {
+            "type": "function",
+            "function": {
+                "name": "answer_product_question",
+                "description": "Generate a natural response to a product-related question",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "response": {
+                            "type": "string",
+                            "description": "The natural language response to the question"
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": "Confidence score between 0 and 1"
+                        },
+                        "needs_clarification": {
+                            "type": "boolean",
+                            "description": "Whether the question needs clarification"
+                        },
+                        "follow_up_questions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Suggested follow-up questions"
+                        }
+                    },
+                    "required": ["response", "confidence", "needs_clarification"]
+                }
             }
+        }
 
         ]
 
@@ -253,6 +283,9 @@ class SalesAgent:
     async def _classify_query(self, message: str, conversation: Conversation = None) -> dict:
         """Use LLM to classify if the query is laptop-related, considering conversation context"""
         try:
+            # First identify if the query is about a specific product from context
+            product_context = await self._identify_product_context(message, conversation)
+            
             # Build context from conversation history
             context_messages = []
             if conversation and conversation.messages:
@@ -306,12 +339,26 @@ class SalesAgent:
             )
 
             tool_call = completion.choices[0].message.tool_calls[0]
-            return json.loads(tool_call.function.arguments)
+            classification = json.loads(tool_call.function.arguments)
+            
+            # Enhance classification with product context
+            if not product_context["needs_clarification"]:
+                classification["query_type"] = "specific_product"
+                classification["specific_details"] = {
+                    "product_identifiers": [product_context["identified_product"]["product_id"]],
+                    "features_mentioned": [],
+                    "price_range": {}
+                }
+                classification["confidence"] = product_context["identified_product"]["confidence"]
+            
+            return classification
+
         except Exception as e:
             print(f"Error in query classification: {str(e)}")
             # Default to laptop related in case of error when we have context
             return {
                 "is_laptop_related": bool(conversation and conversation.messages),
+                "query_type": "general",
                 "detected_product_type": "laptop",
                 "confidence": 0.5
             }
@@ -922,25 +969,21 @@ class SalesAgent:
             return "I encountered an error while generating recommendations. Please try again.", []
 
 
-    async def _handle_questions(self, required_info: Dict):
-        """Enhanced question handling with contextual product identification"""
+    async def _handle_questions(self, message: str, conversation: Conversation) -> str:
+        """Enhanced question handling using LLM for natural responses"""
         # First try to get the explicitly selected product
-        selected_product = required_info.get("selected_product")
+        selected_product = conversation.context.get("selected_product")
         
         if not selected_product:
             # If no explicit selection, try to identify from context
-            context_result = await self._identify_product_context(
-                required_info.get("message", ""),
-                required_info.get("conversation")
-            )
-            
+            context_result = await self._identify_product_context(message, conversation)         
             if context_result["needs_clarification"]:
                 return context_result["clarification_message"]
             
             # Find the identified product from last_products
             product_id = context_result["identified_product"]["product_id"]
-            if hasattr(required_info.get("conversation"), "last_products"):
-                for product in required_info["conversation"].last_products:
+            if conversation.last_products:
+                for product in conversation.last_products:
                     if str(product.id) == product_id:
                         selected_product = {
                             "name": product.name,
@@ -958,12 +1001,53 @@ class SalesAgent:
         if not selected_product:
             return "I'm not sure which product you're asking about. Could you please specify?"
 
-        # Rest of the existing _handle_questions logic remains the same
-        aspect = selected_product.get("aspect", "general")
-        
-        if aspect == "price":
-            return f"The {selected_product.get('name')} is priced at ${selected_product.get('price')}. " \
-                   "This price reflects its high-end specifications and build quality."
+        try:
+            # Build context for the LLM
+            system_prompt = """You are a knowledgeable sales assistant specializing in laptops.
+            Generate natural, conversational responses to customer questions about specific products.
+            Consider:
+            1. The specific aspect of the question (price, features, specs, etc.)
+            2. The product's details and specifications
+            3. The conversation history and context
+            4. Any relevant comparisons or alternatives
+            
+            Keep responses:
+            - Natural and conversational
+            - Accurate to the product details
+            - Helpful and informative
+            - Concise but complete
+            """
+
+            # Get recent conversation context
+            recent_messages = [
+                {"role": m.role, "content": m.content}
+                for m in conversation.messages[-3:]  # Last 3 messages for context
+            ]
+
+            completion = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": f"Product details: {json.dumps(selected_product)}"},
+                    *recent_messages,
+                    {"role": "user", "content": message}
+                ],
+                tools=[t for t in self.tools if t["function"]["name"] == "answer_product_question"],
+                tool_choice={"type": "function", "function": {"name": "answer_product_question"}}
+            )
+
+            tool_call = completion.choices[0].message.tool_calls[0]
+            response_data = json.loads(tool_call.function.arguments)
+
+            # Store any suggested follow-up questions in the conversation context
+            if response_data.get("follow_up_questions"):
+                conversation.context["suggested_questions"] = response_data["follow_up_questions"]
+
+            return response_data["response"]
+
+        except Exception as e:
+            print(f"Error generating question response: {str(e)}")
+            return "I apologize, but I encountered an error while processing your question. Could you please rephrase it?"
 
     async def _handle_selection(self, conversation: Conversation):
         """Handle product selection with dynamic response"""

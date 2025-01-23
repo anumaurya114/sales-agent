@@ -56,12 +56,14 @@ async def chat(request: MessageRequest) -> ConversationResponse:
         conversation = Conversation(id=conversation_id)
         conversations[conversation_id] = conversation
 
+    # Update conversation context with any new information
+    if request.context:
+        conversation.context.update(request.context)
+    if request.action:
+        conversation.context["action"] = request.action
+
     # Process message
-    response, products = await agent.process_message(
-        conversation,
-        request.message,
-        selected_product=request.selected_product.dict() if request.selected_product else None,
-    )
+    response, products = await agent.process_message(conversation, request.message)
 
     # Generate suggested questions based on the products
     suggested_questions = []

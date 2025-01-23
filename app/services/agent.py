@@ -112,7 +112,7 @@ class SalesAgent:
             "type": "function",
             "function": {
                 "name": "classify_product_query",
-                "description": "Classify if a user query is related to laptops or other products",
+                "description": "Classify user query type and determine if it's laptop-related",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -120,38 +120,185 @@ class SalesAgent:
                             "type": "boolean",
                             "description": "Whether the query is related to laptops"
                         },
+                        "query_type": {
+                            "type": "string",
+                            "enum": ["general", "specific_product", "feature_inquiry", "comparison"],
+                            "description": "The type of query being made"
+                        },
                         "detected_product_type": {
                             "type": "string",
                             "description": "The type of product detected in the query"
+                        },
+                        "specific_details": {
+                            "type": "object",
+                            "properties": {
+                                "product_identifiers": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "description": "Product names, models, or specific identifiers mentioned"
+                                },
+                                "features_mentioned": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    },
+                                    "description": "Specific features or specifications mentioned"
+                                },
+                                "price_range": {
+                                    "type": "object",
+                                    "properties": {
+                                        "min": {"type": "number"},
+                                        "max": {"type": "number"}
+                                    }
+                                }
+                            }
                         },
                         "confidence": {
                             "type": "number",
                             "description": "Confidence score between 0 and 1"
                         }
                     },
-                    "required": ["is_laptop_related", "detected_product_type", "confidence"]
+                    "required": ["is_laptop_related", "query_type", "detected_product_type", "confidence"]
                 }
             }
-        }
+        },
+        {
+                "type": "function",
+                "function": {
+                    "name": "identify_product_context",
+                    "description": "Identify which product the user is asking about based on conversation context",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "identified_product": {
+                                "type": "object",
+                                "properties": {
+                                    "product_id": {"type": "string"},
+                                    "confidence": {"type": "number"},
+                                    "aspect": {
+                                        "type": "string",
+                                        "enum": ["price", "features", "specs", "general"]
+                                    },
+                                    "reasoning": {"type": "string"}
+                                }
+                            },
+                            "needs_clarification": {"type": "boolean"},
+                            "clarification_message": {"type": "string"}
+                        },
+                        "required": ["identified_product", "needs_clarification"]
+                    }
+                }
+            }
+
         ]
 
-    async def _classify_query(self, message: str) -> dict:
-        """Use LLM to classify if the query is laptop-related"""
+    async def _identify_product_context(self, message: str, conversation: Conversation) -> dict:
+        """Identify which product the user is asking about based on conversation context"""
         try:
+            # Build context from conversation history and available products
+            context_messages = []
+            
+            # Add last few messages for context
+            if conversation and conversation.messages:
+                context_messages = [
+                    {"role": m.role, "content": m.content} 
+                    for m in conversation.messages[-5:]  # Last 5 messages for context
+                ]
+            
+            # Add available products context if any
+            products_context = ""
+            if hasattr(conversation, 'last_products') and conversation.last_products:
+                products_context = "Available products in context:\n"
+                for idx, product in enumerate(conversation.last_products, 1):
+                    products_context += f"{idx}. {product.name} (ID: {product.id})\n"
+
+            completion = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"""You are a product context analyzer. Determine which product the user is asking about.
+                        Consider:
+                        - Direct mentions of product names or features
+                        - References to previously discussed products
+                        - Implicit references based on unique features or prices
+                        - The most recently recommended or discussed product
+                        
+                        Available products in context:
+                        {products_context}
+                        
+                        If you cannot confidently identify the product, set needs_clarification to true.
+                        """
+                    },
+                    *context_messages,
+                    {"role": "user", "content": message}
+                ],
+                tools=[t for t in self.tools if t["function"]["name"] == "identify_product_context"],
+                tool_choice={"type": "function", "function": {"name": "identify_product_context"}}
+            )
+
+            tool_call = completion.choices[0].message.tool_calls[0]
+            return json.loads(tool_call.function.arguments)
+
+        except Exception as e:
+            print(f"Error in product context identification: {str(e)}")
+            return {
+                "identified_product": None,
+                "needs_clarification": True,
+                "clarification_message": "I'm not sure which product you're asking about. Could you please specify?"
+            }
+        
+    async def _classify_query(self, message: str, conversation: Conversation = None) -> dict:
+        """Use LLM to classify if the query is laptop-related, considering conversation context"""
+        try:
+            # Build context from conversation history
+            context_messages = []
+            if conversation and conversation.messages:
+                # Add last few messages for context
+                context_messages = [
+                    {"role": m.role, "content": m.content} 
+                    for m in conversation.messages[-3:]  # Last 3 messages for context
+                ]
+                
+                # Add preferences if available
+                if hasattr(conversation, 'customer_preferences'):
+                    prefs = conversation.customer_preferences
+                    if prefs:
+                        context_messages.append({
+                            "role": "system",
+                            "content": f"Current customer preferences: {json.dumps(prefs)}"
+                        })
+
             completion = self.client.chat.completions.create(
                 model="gpt-4",
                 messages=[
                     {
                         "role": "system",
                         "content": """You are a product query classifier specialized in identifying laptop-related queries.
-                        Analyze the user's message and determine if it's related to laptops or other products.
+                        Analyze the user's message AND conversation context to determine if it's related to laptops or other products.
                         Consider:
                         - Direct mentions of laptops or notebook computers
                         - Laptop-specific features (RAM, processor, etc.)
                         - Computing needs that typically require laptops
-                        - Mentions of other electronic products or accessories
-                        Be strict in classification - only mark as laptop-related if it's clearly about laptops."""
+                        - Laptop model names or series (e.g., XPS, ThinkPad, Omen, etc.)
+                        - References to previously discussed laptops
+                        - Context from earlier conversation
+                        
+                        IMPORTANT: If the query references a specific model or continues a laptop-related conversation,
+                        treat it as laptop-related even if it doesn't explicitly mention "laptop".
+                        
+                        Common laptop brands/series to recognize:
+                        - HP: Omen, Pavilion, Envy, EliteBook
+                        - Dell: XPS, Inspiron, Latitude
+                        - Lenovo: ThinkPad, IdeaPad, Legion
+                        - ASUS: ROG, ZenBook, TUF
+                        - Acer: Predator, Swift, Aspire
+                        - MSI: Gaming series, Creator series
+                        """
                     },
+                    *context_messages,  # Add conversation context
                     {"role": "user", "content": message}
                 ],
                 tools=[t for t in self.tools if t["function"]["name"] == "classify_product_query"],
@@ -162,11 +309,11 @@ class SalesAgent:
             return json.loads(tool_call.function.arguments)
         except Exception as e:
             print(f"Error in query classification: {str(e)}")
-            # Default to non-laptop related in case of error
+            # Default to laptop related in case of error when we have context
             return {
-                "is_laptop_related": False,
-                "detected_product_type": "unknown",
-                "confidence": 0.0
+                "is_laptop_related": bool(conversation and conversation.messages),
+                "detected_product_type": "laptop",
+                "confidence": 0.5
             }
     
     async def _update_conversation_understanding(self, conversation: Conversation):
@@ -522,6 +669,47 @@ class SalesAgent:
             raise
 
     async def _determine_next_action(self, conversation: Conversation) -> Dict:
+        # Get the latest user message
+        latest_message = next((m.content for m in reversed(conversation.messages) 
+                             if m.role == "user"), None)
+        
+        if latest_message:
+            # Classify the query first
+            classification = await self._classify_query(latest_message, conversation)
+            
+            # Adjust action based on query classification
+            if classification["is_laptop_related"]:
+                if classification["query_type"] == "general":
+                    # For general queries, focus on understanding needs
+                    return {
+                        "action": ActionType.UNDERSTAND_NEEDS.value,
+                        "reasoning": "User made a general inquiry, need to gather more specific requirements"
+                    }
+                elif classification["query_type"] == "specific_product":
+                    # For specific product queries, move to search
+                    specific_details = classification.get("specific_details", {})
+                    return {
+                        "action": ActionType.SEARCH_PRODUCTS.value,
+                        "reasoning": "User mentioned specific product details",
+                        "search_params": {
+                            "product_identifiers": specific_details.get("product_identifiers", []),
+                            "features": specific_details.get("features_mentioned", []),
+                            "price_range": specific_details.get("price_range", {})
+                        }
+                    }
+                elif classification["query_type"] == "feature_inquiry":
+                    # For feature-specific questions
+                    return {
+                        "action": ActionType.GATHER_REQUIREMENTS.value,
+                        "reasoning": "User is asking about specific features"
+                    }
+                elif classification["query_type"] == "comparison":
+                    # For comparison queries
+                    return {
+                        "action": ActionType.PROVIDE_RECOMMENDATIONS.value,
+                        "reasoning": "User wants to compare products"
+                    }
+            
         system_message = f"""
         You are an intelligent sales assistant. Current state: {self.current_state.value}
         
@@ -735,40 +923,52 @@ class SalesAgent:
 
 
     async def _handle_questions(self, required_info: Dict):
-        # Get the selected product from the conversation context
+        """Enhanced question handling with contextual product identification"""
+        # First try to get the explicitly selected product
         selected_product = required_info.get("selected_product")
         
         if not selected_product:
-            return "I'm not sure which product you're asking about. Could you please specify which product you'd like to know more about?"
+            # If no explicit selection, try to identify from context
+            context_result = await self._identify_product_context(
+                required_info.get("message", ""),
+                required_info.get("conversation")
+            )
+            
+            if context_result["needs_clarification"]:
+                return context_result["clarification_message"]
+            
+            # Find the identified product from last_products
+            product_id = context_result["identified_product"]["product_id"]
+            if hasattr(required_info.get("conversation"), "last_products"):
+                for product in required_info["conversation"].last_products:
+                    if str(product.id) == product_id:
+                        selected_product = {
+                            "name": product.name,
+                            "price": product.price,
+                            "features": product.features,
+                            "description": product.description,
+                            "metadata": {
+                                "category": getattr(product, "category", ""),
+                                "brand": getattr(product, "brand", "")
+                            },
+                            "aspect": context_result["identified_product"]["aspect"]
+                        }
+                        break
+        
+        if not selected_product:
+            return "I'm not sure which product you're asking about. Could you please specify?"
 
-        # Get the aspect the user is asking about
+        # Rest of the existing _handle_questions logic remains the same
         aspect = selected_product.get("aspect", "general")
-        product_id = selected_product.get("product_id")
-
-        # Format response based on the aspect
+        
         if aspect == "price":
             return f"The {selected_product.get('name')} is priced at ${selected_product.get('price')}. " \
                    "This price reflects its high-end specifications and build quality."
-        elif aspect == "features":
-            features = selected_product.get('features', [])
-            return f"The key features of {selected_product.get('name')} include:\n" + \
-                   "\n".join([f"• {feature}" for feature in features])
-        elif aspect == "specs":
-            return f"Here are the detailed specifications of {selected_product.get('name')}:\n" + \
-                   f"{selected_product.get('description')}\n" + \
-                   f"Features: {selected_product.get('features')}"
-        else:
-            # General information about the product
-            return f"The {selected_product.get('name')} is a {selected_product.get('metadata', {}).get('category', '')} " \
-                   f"from {selected_product.get('metadata', {}).get('brand', '')}.\n" \
-                   f"Price: ${selected_product.get('price')}\n" \
-                   f"Description: {selected_product.get('description')}\n" \
-                   f"Key Features: {selected_product.get('features')}\n\n" \
-                   "Would you like to know more about any specific aspect of this product?"
 
-    async def _handle_selection(self, required_info: Dict, selection_params: Dict):
+    async def _handle_selection(self, conversation: Conversation):
         """Handle product selection with dynamic response"""
-        selected_product = required_info.get("selected_product", {})
+        # Get selected product from conversation context
+        selected_product = conversation.context.get("selected_product", {})
         if not selected_product:
             return "I couldn't find the product you selected. Could you please try again?"
 
@@ -778,8 +978,8 @@ class SalesAgent:
         context = {
             "product_name": product_name,
             "price": price,
-            "action": selection_params.get("action", "view"),
-            "comparison": selection_params.get("compare_with", []),
+            "action": conversation.context.get("action", "view"),
+            "comparison": conversation.context.get("comparison_products", []),
         }
 
         try:
@@ -845,7 +1045,7 @@ class SalesAgent:
         self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None
     ):
         """Process an incoming message and return a response"""
-        classification = await self._classify_query(message)
+        classification = await self._classify_query(message, conversation)  # Pass conversation here
         print(f"\n\n#############\n\n classification {classification} \n\n#################\n\n")
         if not classification["is_laptop_related"]:
             detected_product = classification["detected_product_type"]

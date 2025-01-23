@@ -31,9 +31,11 @@ class SalesAgent:
         self.current_state = ActionType.WELCOME
         self.tools = self._create_tools()
         self.db = ProductDatabase()
+        self.product_type = "laptop"
 
     def _create_tools(self) -> list:
         return [
+            # Existing determine_next_action tool
             {
                 "type": "function",
                 "function": {
@@ -50,91 +52,268 @@ class SalesAgent:
                             "reasoning": {
                                 "type": "string",
                                 "description": "Explanation for why this action was chosen",
-                            },
-                            "required_info": {
-                                "type": "object",
-                                "properties": {
-                                    "product_type": {"type": "string"},
-                                    "budget": {"type": "string"},
-                                    "preferences": {"type": "array", "items": {"type": "string"}},
-                                    "constraints": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "description": "Basic information gathered or needed for the action",
-                            },
-                            "search_params": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {"type": "string"},
-                                    "price_min": {"type": "number"},
-                                    "price_max": {"type": "number"},
-                                    "brand": {"type": "string"},
-                                    "category": {"type": "string"},
-                                    "features": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "description": "Parameters specific to product search",
-                            },
-                            "recommendation_params": {
-                                "type": "object",
-                                "properties": {
-                                    "use_case": {"type": "string"},
-                                    "priority_features": {"type": "array", "items": {"type": "string"}},
-                                    "similar_to_product": {"type": "string"},
-                                    "exclude_brands": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "description": "Parameters specific to product recommendations",
-                            },
-                            "selection_params": {
-                                "type": "object",
-                                "properties": {
-                                    "selected_product_id": {"type": "string"},
-                                    "quantity": {"type": "integer"},
-                                    "customization_options": {"type": "object"},
-                                    "delivery_preferences": {"type": "string"},
-                                },
-                                "description": "Parameters specific to product selection",
-                            },
+                            }
                         },
-                        "required": ["action", "reasoning"],
-                    },
-                },
+                        "required": ["action", "reasoning"]
+                    }
+                }
+            },
+            # New tool for updating conversation context
+            {
+                "type": "function",
+                "function": {
+                    "name": "update_conversation_context",
+                    "description": "Extract and update conversation context from user messages",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "context": {
+                                "type": "object",
+                                "properties": {
+                                    "budget": {
+                                        "type": "object",
+                                        "properties": {
+                                            "min": {"type": "number"},
+                                            "max": {"type": "number"}
+                                        }
+                                    },
+                                    "stage": {"type": "string"},
+                                    "last_discussed_topic": {"type": "string"},
+                                    "needs_clarification": {"type": "boolean"}
+                                }
+                            },
+                            "preferences": {
+                                "type": "object",
+                                "properties": {
+                                    "use_case": {
+                                        "type": "string",
+                                        "enum": ["gaming", "business", "student", "creative", "general"]
+                                    },
+                                    "features": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "brand_preferences": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    },
+                                    "performance_requirements": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                }
+                            }
+                        },
+                        "required": ["context", "preferences"]
+                    }
+                }
             }
         ]
+    
+    async def _update_conversation_understanding(self, conversation: Conversation):
+        """Use LLM to understand and update conversation context"""
+        messages = [
+            {
+                "role": "system",
+                "content": """You are an AI assistant that extracts structured information from customer conversations.
+                Parse the conversation to understand:
+                - Budget constraints
+                - Use case requirements
+                - Feature preferences
+                - Performance needs
+                - Brand preferences
+                Be precise and only include information that was explicitly mentioned or can be confidently inferred.
+                
+                IMPORTANT: Return a valid JSON object with the following structure:
+                {
+                    "context": {
+                        "budget": {"min": number, "max": number},
+                        "stage": string,
+                        "last_discussed_topic": string,
+                        "needs_clarification": boolean
+                    },
+                    "preferences": {
+                        "use_case": string,
+                        "features": string[],
+                        "brand_preferences": string[],
+                        "performance_requirements": string[]
+                    }
+                }"""
+            }
+        ]
+        
+        # Add conversation history
+        messages.extend([{"role": m.role, "content": m.content} for m in conversation.messages])
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=messages,
+                tools=[t for t in self.tools if t["function"]["name"] == "update_conversation_context"],
+                tool_choice={"type": "function", "function": {"name": "update_conversation_context"}}
+            )
+
+            # Extract the parsed information
+            tool_call = completion.choices[0].message.tool_calls[0]
+            
+            try:
+                # Clean and validate the JSON string
+                json_str = tool_call.function.arguments.strip()
+                
+                # Handle potential leading/trailing characters
+                if json_str.startswith('```json'):
+                    json_str = json_str[7:]
+                if json_str.endswith('```'):
+                    json_str = json_str[:-3]
+                
+                # Remove any non-JSON content
+                start_idx = json_str.find('{')
+                end_idx = json_str.rfind('}') + 1
+                if start_idx != -1 and end_idx != 0:
+                    json_str = json_str[start_idx:end_idx]
+                
+                parsed_info = json.loads(json_str)
+                
+                # Validate the structure and provide defaults
+                default_context = {
+                    "budget": {"min": None, "max": None},
+                    "stage": "initial",
+                    "last_discussed_topic": None,
+                    "needs_clarification": True
+                }
+                
+                default_preferences = {
+                    "use_case": None,
+                    "features": [],
+                    "brand_preferences": [],
+                    "performance_requirements": []
+                }
+                
+                # Ensure proper structure with defaults
+                if "context" not in parsed_info:
+                    parsed_info["context"] = default_context
+                else:
+                    parsed_info["context"] = {**default_context, **parsed_info["context"]}
+                
+                if "preferences" not in parsed_info:
+                    parsed_info["preferences"] = default_preferences
+                else:
+                    parsed_info["preferences"] = {**default_preferences, **parsed_info["preferences"]}
+                
+                # Update conversation with parsed information
+                conversation.context.update(parsed_info["context"])
+                conversation.customer_preferences.update(parsed_info["preferences"])
+
+                return parsed_info
+
+            except json.JSONDecodeError as je:
+                print(f"JSON parsing error: {je}")
+                print(f"Problematic JSON string: {json_str}")
+                
+                # Attempt to create a basic understanding
+                basic_understanding = {
+                    "context": default_context,
+                    "preferences": default_preferences
+                }
+                
+                # Update conversation with basic understanding
+                conversation.context.update(basic_understanding["context"])
+                conversation.customer_preferences.update(basic_understanding["preferences"])
+                
+                return basic_understanding
+                
+            except Exception as e:
+                print(f"Error processing parsed information: {str(e)}")
+                return None
+
+        except Exception as e:
+            print(f"Error in API call: {str(e)}")
+            return None
+    
+
+    async def _handle_understand_needs(self, conversation: Conversation):
+        """Handle understanding needs with LLM-powered context understanding"""
+        try:
+            # Update conversation understanding
+            understanding = await self._update_conversation_understanding(conversation)
+            
+            if not understanding:
+                return "I apologize, but I'm having trouble understanding. Could you please rephrase that?"
+
+            # Generate search parameters based on current understanding
+            search_params = {
+                "query": understanding["preferences"].get("use_case", ""),
+                "min_price": understanding["context"].get("budget", {}).get("min"),
+                "max_price": understanding["context"].get("budget", {}).get("max"),
+                "features": understanding["preferences"].get("features", []),
+                "brand": understanding["preferences"].get("brand_preferences", []),
+            }
+
+            # Get relevant products if we have enough information
+            if understanding["preferences"].get("use_case") and understanding["preferences"].get("features"):
+                products = await self.db.search_products(**search_params)
+                conversation.last_products = products[:6]  # Store top 3 matches
+
+            # Generate contextual response using LLM
+            response = await self._generate_contextual_response(conversation, understanding)
+            return response
+
+        except Exception as e:
+            print(f"Error in handle_understand_needs: {str(e)}")
+            return "Could you tell me more about what you're looking for in a laptop?"
+    
+    async def _generate_contextual_response(self, conversation: Conversation, understanding: dict) -> str:
+        """Generate a natural response based on current understanding"""
+        messages = [
+            {
+                "role": "system",
+                "content": """You are a helpful sales assistant> Behave like real life. Generate a natural, conversational response that:
+                1. Acknowledges what you understand about the customer's needs
+                2. Asks for clarification on missing information
+                3. Makes relevant suggestions based on the information available
+                4. Keep response limited to 2-3 sentences.
+                Keep responses concise and focused on the next most important piece of information needed."""
+            },
+            {
+                "role": "user",
+                "content": f"Current understanding: {json.dumps(understanding)}\nProducts found: {len(conversation.last_products)}"
+            }
+        ]
+
+        completion = self.client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            max_tokens=150  # Keep responses concise
+        )
+
+        return completion.choices[0].message.content
 
     async def process_message(
         self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None
     ):
         """Process an incoming message and return a response"""
-        # Add user message to conversation
-        conversation.add_message("user", message)
-
-        # Determine next action
-        next_action = await self._determine_next_action(conversation)
-
-        # Execute action and get response
-        try:
-            # Execute action and await the response
-            response = await self._execute_action(next_action, conversation)
-            
-            # Ensure we have a string response
-            if not isinstance(response, str):
-                print(f"Warning: Response is not a string, got {type(response)}")
-                response = str(response)
-
-            # Add assistant's response to conversation
+        # Check for non-laptop related queries
+        non_laptop_keywords = ["phone", "desktop", "tablet", "watch", "headphone", "printer", "monitor", "keyboard", "mouse"]
+        if any(keyword in message.lower() for keyword in non_laptop_keywords):
+            response = "I specialize in helping you find the perfect laptop. For other products, please contact our general sales team. What kind of laptop are you looking for?"
             conversation.add_message("assistant", response)
+            return response, []
 
-            # Return both response and products if available
+        # Continue with existing message processing
+        conversation.add_message("user", message)
+        next_action = await self._determine_next_action(conversation)
+        
+        try:
+            response = await self._execute_action(next_action, conversation)
+            if not isinstance(response, str):
+                response = str(response)
+            conversation.add_message("assistant", response)
             return response, getattr(conversation, "last_products", [])
-            
         except Exception as e:
             print(f"Error in process_message: {str(e)}")
-            # Provide a fallback response
-            fallback_response = (
-                "I apologize, but I encountered an error. "
-                "Could you please rephrase your request or try again?"
-            )
-            conversation.add_message("assistant", fallback_response)
-            return fallback_response, []
+            fallback = "I didn't quite catch that. Could you rephrase what you're looking for in a laptop?"
+            conversation.add_message("assistant", fallback)
+            return fallback, []
 
     def _create_prompt_tools(self) -> list:
         """Create tools for prompt generation"""
@@ -142,7 +321,7 @@ class SalesAgent:
             "type": "function",
             "function": {
                 "name": "generate_prompt_response",
-                "description": "Generate a formatted response for different conversation stages",
+                "description": "Generate a formatted response for different conversation stages. Keep it short and concise.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -163,7 +342,7 @@ class SalesAgent:
         
         system_prompts = {
             "welcome": (
-                "You are a helpful sales assistant. Generate a warm, friendly welcome message that: "
+                "You are a helpful sales assistant> Behave like real life. Generate a natural, conversational and short response that: "
                 "1. Introduces yourself as an AI shopping assistant "
                 "2. Explains how you can help find the perfect laptop "
                 "3. Lists 3-4 key ways users can interact with you "
@@ -171,7 +350,7 @@ class SalesAgent:
                 "Keep the tone professional but friendly. Format with emojis and bullet points."
             ),
             "understand_needs": (
-                "You are a helpful sales assistant. Generate a response that helps understand the customer's needs. "
+                "You are a helpful sales assistant> Behave like real life. Generate a natural, conversational and short response that"
                 "Consider any previous responses in the context. "
                 "Your response should: "
                 "1. Acknowledge any information they've already shared "
@@ -182,7 +361,7 @@ class SalesAgent:
                 "Format with clear spacing and bullet points where appropriate."
             ),
             "selection": (
-                "You are a helpful sales assistant. Generate a response for a customer who has selected a product. "
+                "You are a helpful sales assistant> Behave like real life sales assistant. Generate a response for a customer who has selected a product. Keep it short and simple."
                 "Context: {product_name} has been selected. "
                 "Include: "
                 "1. Confirmation of their selection "
@@ -202,7 +381,7 @@ class SalesAgent:
         try:
             user_message = (
                 f"Generate a response for {prompt_type}. "
-                f"Format it naturally with appropriate spacing and structure."
+                f"Format it naturally with appropriate spacing and structure. Keep it short and simple."
             )
             if context:
                 user_message += f" Consider this context: {formatted_context}"
@@ -414,12 +593,6 @@ class SalesAgent:
 
             # Format response with product details
             response = "Based on your requirements, here are some products that match your criteria:\n\n"
-            for product in products:
-                response += f"🔍 {product.name}\n"
-                response += f"💰 Price: ${product.price}\n"
-                response += f"✨ Features: {product.features}\n"
-                response += f"📝 Description: {product.description}\n"
-                response += f"{product.match_explanation}\n\n"
 
             response += "\nWould you like more specific details about any of these products? Or shall we refine the search further?"
             return response, products
@@ -578,73 +751,6 @@ class SalesAgent:
         except Exception as e:
             print(f"Error generating welcome prompt: {str(e)}")
             raise
-
-    async def _handle_understand_needs(self, conversation: Conversation):
-        """Handle understanding needs with live product suggestions."""
-        try:
-            # Analyze conversation for existing information
-            conversation_text = " ".join(m.content.lower() for m in conversation.messages)
-            current_info = self._extract_current_requirements(conversation_text)
-            
-            # Format the query string properly
-            query_terms = []
-            if current_info.get("keywords"):
-                query_terms.extend(current_info["keywords"])
-            if "laptop" not in query_terms:  # Add laptop if not present
-                query_terms.append("laptop")
-            
-            query = " ".join(query_terms) if query_terms else "laptop"  # Ensure query is a string
-            
-            # Get filtered products based on current information
-            filtered_products = await self.db.search_products(
-                query=query,  # Pass the properly formatted query string
-                min_price=current_info.get("min_price"),
-                max_price=current_info.get("max_price"),
-                preferences=current_info.get("preferences", []),
-                n_results=3  # Show fewer products at this early stage
-            )
-
-            # Generate base response using the prompt template
-            context = {
-                "previous_responses": [m.content for m in conversation.messages if m.role == "user"],
-                "current_state": self.current_state.value,
-                "current_understanding": current_info,
-                "found_products": bool(filtered_products)
-            }
-            
-            base_response = await self._generate_prompt("understand_needs", context)
-
-            # Add product suggestions if any were found
-            if filtered_products:
-                product_section = "\n\nBased on what you've mentioned, here are some initial suggestions:\n\n"
-                for product in filtered_products:
-                    product_section += f"💻 {product.name}\n"
-                    product_section += f"   💰 ${product.price:,.2f}\n"
-                    if product.features:
-                        top_features = (
-                            product.features[:2] 
-                            if isinstance(product.features, list) 
-                            else product.features.split('\n')[:2]
-                        )
-                        product_section += f"   ✨ Highlights: {', '.join(top_features)}\n"
-                    product_section += "\n"
-                
-                product_section += "\nThese are just initial matches. Let me ask you a few questions to find the perfect laptop for you.\n"
-                response = base_response + product_section
-            else:
-                response = base_response
-
-            # Store products in conversation for the main.py response
-            conversation.last_products = filtered_products
-            
-            return response
-
-        except Exception as e:
-            print(f"Error in _handle_understand_needs: {str(e)}")
-            # Log the full error details for debugging
-            import traceback
-            print(f"Full error traceback:\n{traceback.format_exc()}")
-            return "Could you tell me more about what you're looking for in a laptop?"
 
     async def process_message(
         self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None

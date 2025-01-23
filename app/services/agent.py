@@ -404,40 +404,6 @@ class SalesAgent:
 
         return completion.choices[0].message.content
 
-    async def process_message(
-        self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None
-    ):
-        """Process an incoming message and return a response"""
-        # Check for non-laptop related queries
-        """Process an incoming message and return a response"""
-    # First, classify the query
-        classification = await self._classify_query(message)
-        print(f"classification {classification}")
-        if not classification["is_laptop_related"]:
-            detected_product = classification["detected_product_type"]
-            response = (
-                f"I apologize, but I specialize exclusively in laptop recommendations. "
-                f"I notice you're asking about {detected_product}. "
-                "If you'd like help finding a laptop, I'd be happy to assist you with that instead. "
-            )
-            conversation.add_message("assistant", response)
-            return response, []
-        # Continue with existing message processing
-        conversation.add_message("user", message)
-        next_action = await self._determine_next_action(conversation)
-        
-        try:
-            response = await self._execute_action(next_action, conversation)
-            if not isinstance(response, str):
-                response = str(response)
-            conversation.add_message("assistant", response)
-            return response, getattr(conversation, "last_products", [])
-        except Exception as e:
-            print(f"Error in process_message: {str(e)}")
-            fallback = "I didn't quite catch that. Could you rephrase what you're looking for in a laptop?"
-            conversation.add_message("assistant", fallback)
-            return fallback, []
-
     def _create_prompt_tools(self) -> list:
         """Create tools for prompt generation"""
         return [{
@@ -651,7 +617,7 @@ class SalesAgent:
 
         try:
             if action == "welcome":
-                return await self._handle_welcome()
+                return await self._handle_welcome(conversation=conversation)
             elif action == "understand_needs":
                 print("understanding needs")
                 return await self._handle_understand_needs(conversation=conversation)
@@ -868,7 +834,7 @@ class SalesAgent:
             )
 
     # Update other handlers to use dynamic prompts
-    async def _handle_welcome(self):
+    async def _handle_welcome(self, conversation):
         try:
             return await self._generate_prompt("welcome")
         except Exception as e:
@@ -879,6 +845,17 @@ class SalesAgent:
         self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None
     ):
         """Process an incoming message and return a response"""
+        classification = await self._classify_query(message)
+        print(f"\n\n#############\n\n classification {classification} \n\n#################\n\n")
+        if not classification["is_laptop_related"]:
+            detected_product = classification["detected_product_type"]
+            response = (
+                f"I apologize, but I specialize exclusively in laptop recommendations. "
+                f"I notice you're asking about {detected_product}. "
+                "If you'd like help finding a laptop, I'd be happy to assist you with that instead. "
+            )
+            conversation.add_message("assistant", response)
+            return response, []
         # Add user message to conversation
         conversation.add_message("user", message)
 

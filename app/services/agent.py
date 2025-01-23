@@ -107,8 +107,67 @@ class SalesAgent:
                         "required": ["context", "preferences"]
                     }
                 }
+            },
+            {
+            "type": "function",
+            "function": {
+                "name": "classify_product_query",
+                "description": "Classify if a user query is related to laptops or other products",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "is_laptop_related": {
+                            "type": "boolean",
+                            "description": "Whether the query is related to laptops"
+                        },
+                        "detected_product_type": {
+                            "type": "string",
+                            "description": "The type of product detected in the query"
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": "Confidence score between 0 and 1"
+                        }
+                    },
+                    "required": ["is_laptop_related", "detected_product_type", "confidence"]
+                }
             }
+        }
         ]
+
+    async def _classify_query(self, message: str) -> dict:
+        """Use LLM to classify if the query is laptop-related"""
+        try:
+            completion = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are a product query classifier specialized in identifying laptop-related queries.
+                        Analyze the user's message and determine if it's related to laptops or other products.
+                        Consider:
+                        - Direct mentions of laptops or notebook computers
+                        - Laptop-specific features (RAM, processor, etc.)
+                        - Computing needs that typically require laptops
+                        - Mentions of other electronic products or accessories
+                        Be strict in classification - only mark as laptop-related if it's clearly about laptops."""
+                    },
+                    {"role": "user", "content": message}
+                ],
+                tools=[t for t in self.tools if t["function"]["name"] == "classify_product_query"],
+                tool_choice={"type": "function", "function": {"name": "classify_product_query"}}
+            )
+
+            tool_call = completion.choices[0].message.tool_calls[0]
+            return json.loads(tool_call.function.arguments)
+        except Exception as e:
+            print(f"Error in query classification: {str(e)}")
+            # Default to non-laptop related in case of error
+            return {
+                "is_laptop_related": False,
+                "detected_product_type": "unknown",
+                "confidence": 0.0
+            }
     
     async def _update_conversation_understanding(self, conversation: Conversation):
         """Use LLM to understand and update conversation context"""
@@ -236,6 +295,7 @@ class SalesAgent:
         try:
             # Update conversation understanding
             understanding = await self._update_conversation_understanding(conversation)
+            print(f"\n\n understanding {understanding} \n\n")
             
             if not understanding:
                 return "I apologize, but I'm having trouble understanding. Could you please rephrase that?"
@@ -249,18 +309,74 @@ class SalesAgent:
                 "brand": understanding["preferences"].get("brand_preferences", []),
             }
 
-            # Get relevant products if we have enough information
-            if understanding["preferences"].get("use_case") and understanding["preferences"].get("features"):
-                products = await self.db.search_products(**search_params)
-                conversation.last_products = products[:6]  # Store top 3 matches
+            # Get available options from database first
+            available_products = await self.db.search_products(**search_params)
 
-            # Generate contextual response using LLM
-            response = await self._generate_contextual_response(conversation, understanding)
-            return response
+            print(f"Available products found for current preferences {available_products}")
+            
+            if available_products:
+                # Extract common features and brands from available products
+                common_features = set()
+                available_brands = set()
+                price_ranges = []
+                
+                for product in available_products:
+                    if hasattr(product, 'features'):
+                        common_features.update(product.features.split('\n'))
+                    if hasattr(product, 'brand'):
+                        available_brands.add(product.brand)
+                    if hasattr(product, 'price'):
+                        price_ranges.append(product.price)
+                
+                # Store top matches
+                conversation.last_products = available_products[:6]
+                
+                # Generate contextual response using available options
+                context = {
+                    "understanding": understanding,
+                    "available_options": {
+                        "features": list(common_features)[:5],  # Top 5 common features
+                        "brands": list(available_brands),
+                        "price_range": {
+                            "min": min(price_ranges) if price_ranges else None,
+                            "max": max(price_ranges) if price_ranges else None
+                        }
+                    }
+                }
+                
+                return await self._generate_options_response(conversation, context)
+            
+            # If no products found, fall back to general questions
+            return await self._generate_contextual_response(conversation, understanding)
 
         except Exception as e:
             print(f"Error in handle_understand_needs: {str(e)}")
             return "Could you tell me more about what you're looking for in a laptop?"
+
+    async def _generate_options_response(self, conversation: Conversation, context: dict) -> str:
+        """Generate a response that suggests available options"""
+        messages = [
+            {
+                "role": "system",
+                "content": """You are a helpful sales assistant. Generate a natural, conversational response that:
+                1. Acknowledges what you understand about the customer's needs
+                2. Suggests 2-3 available features or options from the database that match their requirements
+                3. Asks a specific question about their preference between the suggested options
+                Keep responses concise and focused on available choices rather than open-ended questions."""
+            },
+            {
+                "role": "user",
+                "content": f"Current understanding and available options: {json.dumps(context)}"
+            }
+        ]
+
+        completion = self.client.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            max_tokens=150
+        )
+
+        return completion.choices[0].message.content
     
     async def _generate_contextual_response(self, conversation: Conversation, understanding: dict) -> str:
         """Generate a natural response based on current understanding"""
@@ -293,12 +409,19 @@ class SalesAgent:
     ):
         """Process an incoming message and return a response"""
         # Check for non-laptop related queries
-        non_laptop_keywords = ["phone", "desktop", "tablet", "watch", "headphone", "printer", "monitor", "keyboard", "mouse"]
-        if any(keyword in message.lower() for keyword in non_laptop_keywords):
-            response = "I specialize in helping you find the perfect laptop. For other products, please contact our general sales team. What kind of laptop are you looking for?"
+        """Process an incoming message and return a response"""
+    # First, classify the query
+        classification = await self._classify_query(message)
+        print(f"classification {classification}")
+        if not classification["is_laptop_related"]:
+            detected_product = classification["detected_product_type"]
+            response = (
+                f"I apologize, but I specialize exclusively in laptop recommendations. "
+                f"I notice you're asking about {detected_product}. "
+                "If you'd like help finding a laptop, I'd be happy to assist you with that instead. "
+            )
             conversation.add_message("assistant", response)
             return response, []
-
         # Continue with existing message processing
         conversation.add_message("user", message)
         next_action = await self._determine_next_action(conversation)

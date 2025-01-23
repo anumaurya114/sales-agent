@@ -283,6 +283,18 @@ class SalesAgent:
     async def _classify_query(self, message: str, conversation: Conversation = None) -> dict:
         """Use LLM to classify if the query is laptop-related, considering conversation context"""
         try:
+            specific_product = await self._identify_product_from_message(message, conversation)
+            if specific_product:
+                return {
+                    "is_laptop_related": True,
+                    "query_type": "specific_product",
+                    "specific_details": {
+                        "product_identifiers": [specific_product["name"]],
+                        "features_mentioned": [],
+                        "price_range": {}
+                    },
+                    "confidence": 0.9
+                    }
             # First identify if the query is about a specific product from context
             product_context = await self._identify_product_context(message, conversation)
             
@@ -1124,13 +1136,45 @@ class SalesAgent:
         except Exception as e:
             print(f"Error generating welcome prompt: {str(e)}")
             raise
+    
+    async def _identify_product_from_message(self, message: str, conversation: Conversation) -> Optional[Dict]:
+        """Helper method to identify specific product references in messages"""
+        if not conversation.last_products:
+            return None
+            
+        # Create a mapping of product names to products for easy lookup
+        product_map = {
+            product.name.lower(): product
+            for product in conversation.last_products
+        }
+        
+        # Also map partial names (e.g., "ProBook" for "ProBook X1")
+        for product in conversation.last_products:
+            brand = product.metadata.get("brand", "").lower()
+            if brand:
+                product_map[brand] = product
+        
+        # Check message for product references
+        message_lower = message.lower()
+        for product_name in product_map:
+            if product_name in message_lower:
+                product = product_map[product_name]
+                return {
+                    "name": product.name,
+                    "price": product.price,
+                    "features": product.features,
+                    "description": product.description,
+                    "metadata": product.metadata
+                }
+        
+        return None
 
-    async def process_message(
-        self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None
-    ):
+    async def process_message(self, conversation: Conversation, message: str, selected_product: Optional[Dict] = None):
         """Process an incoming message and return a response"""
-        classification = await self._classify_query(message, conversation)  # Pass conversation here
-        print(f"\n\n#############\n\n classification {classification} \n\n#################\n\n")
+        # First classify the query
+        classification = await self._classify_query(message, conversation)
+        print(f"\n\nClassification: {classification}\n\n")
+        
         if not classification["is_laptop_related"]:
             detected_product = classification["detected_product_type"]
             response = (
@@ -1139,30 +1183,27 @@ class SalesAgent:
                 "If you'd like help finding a laptop, I'd be happy to assist you with that instead. "
             )
             conversation.add_message("assistant", response)
-            return response, []
+            return response, conversation.last_products
+
         # Add user message to conversation
         conversation.add_message("user", message)
 
-        # Determine next action
-        next_action = await self._determine_next_action(conversation)
-
-        # Execute action and get response
         try:
-            # Execute action and await the response
+            # Check if this is a question about a specific product
+            if classification["query_type"] == "specific_product":
+                # Handle specific product question
+                response = await self._handle_questions(message, conversation)
+                return response, conversation.last_products  # Keep existing products in context
+                
+            # Otherwise, determine next action and execute it
+            next_action = await self._determine_next_action(conversation)
             response = await self._execute_action(next_action, conversation)
             
-            # Ensure we have a string response
-            if not isinstance(response, str):
-                print(f"Warning: Response is not a string, got {type(response)}")
-                response = str(response)
-
             # Add assistant's response to conversation
             conversation.add_message("assistant", response)
-
-            # Return both response and products
-            # If no products were set during action execution, return empty list
-            return response, getattr(conversation, "last_products", [])
             
+            return response, getattr(conversation, "last_products", [])
+                
         except Exception as e:
             print(f"Error in process_message: {str(e)}")
             fallback_response = (
@@ -1170,7 +1211,7 @@ class SalesAgent:
                 "Could you please rephrase your request or try again?"
             )
             conversation.add_message("assistant", fallback_response)
-            return fallback_response, []
+            return fallback_response, conversation.last_products
 
     def _extract_current_requirements(self, conversation_text: str) -> dict:
         """Extract current requirements from conversation text."""
